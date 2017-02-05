@@ -220,6 +220,7 @@ struct cp210x_serial_private {
 	struct gpio_chip	gc;
 	u8			config;
 	u8			gpio_mode;
+	u8			gpio_direction;
 	bool			gpio_registered;
 #endif
 	u8			partnum;
@@ -414,6 +415,20 @@ struct cp210x_pin_mode {
 #define CP210X_PIN_MODE_GPIO		BIT(0)
 
 /*
+ * Port configuration for CP2104.
+ * CP210X_VENDOR_SPECIFIC, CP210X_GET_PORTCONFIG call reads these 0xd bytes.
+ * Structure needs padding due to unused/unspecified bytes.
+ */
+struct cp2104_config {
+	__le16	gpio_mode;
+	u8	__pad0[2];
+	__le16	reset_state;
+	u8	__pad1[4];
+	__le16	suspend_state;
+	u8	cfg;
+} __packed;
+
+/*
  * Port configuration for CP2105.
  * CP210X_VENDOR_SPECIFIC, CP210X_GET_PORTCONFIG call reads these 0xf bytes.
  * Structure needs padding due to unused/unspecified bytes.
@@ -430,11 +445,18 @@ struct cp2105_config {
 } __packed;
 
 /* GPIO modes */
+#define CP2104_GPIO_MODE_MASK		GENMASK(3, 0)
+
 #define CP2105_SCI_GPIO_MODE_OFFSET	9
 #define CP2105_SCI_GPIO_MODE_MASK	GENMASK(11, 9)
 
 #define CP2105_ECI_GPIO_MODE_OFFSET	2
 #define CP2105_ECI_GPIO_MODE_MASK	GENMASK(3, 2)
+
+/* CP2104 port configuration values */
+#define CP2104_GPIO0_TXLED_MODE		BIT(0)
+#define CP2104_GPIO1_RXLED_MODE		BIT(1)
+#define CP2104_GPIO2_RS485_MODE		BIT(2)
 
 /* CP2105 port configuration values */
 #define CP2105_GPIO0_TXLED_MODE		BIT(0)
@@ -442,9 +464,12 @@ struct cp2105_config {
 #define CP2105_GPIO1_RS485_MODE		BIT(2)
 
 /* CP210X_VENDOR_SPECIFIC, CP210X_WRITE_LATCH call writes these 0x2 bytes. */
-struct cp210x_gpio_write {
-	u8	mask;
-	u8	state;
+union cp210x_gpio_write {
+	struct {
+		u8	mask;
+		u8	state;
+	} __packed;
+	u16 mask_and_state;
 } __packed;
 
 /*
@@ -686,6 +711,31 @@ static int cp210x_write_vendor_block(struct usb_serial *serial, u8 type,
 			"failed to set vendor val 0x%04x size %d: %d\n", val,
 			bufsize, result);
 		if (result >= 0)
+			result = -EIO;
+	}
+
+	return result;
+}
+
+/*
+ * Writes u16 vendor value of CP210X registers using "index" in USB control
+ * message. Data in "index" must be in native USB byte order.
+ */
+static int cp210x_write_vendor_index(struct usb_serial *serial, u8 type,
+				     u16 val, u16 index)
+{
+	int result;
+
+	result = usb_control_msg(serial->dev, usb_sndctrlpipe(serial->dev, 0),
+				 CP210X_VENDOR_SPECIFIC, type, val,
+				 index, NULL, 0,
+				 USB_CTRL_SET_TIMEOUT);
+
+	if (result) {
+		dev_err(&serial->interface->dev,
+			"failed to set vendor val 0x%04x index 0x%04x: %d\n",
+			val, index, result);
+		if (result > 0)
 			result = -EIO;
 	}
 
@@ -1262,6 +1312,29 @@ static void cp210x_break_ctl(struct tty_struct *tty, int break_state)
 }
 
 #ifdef CONFIG_GPIOLIB
+static int cp2104_gpio_request(struct gpio_chip *gc, unsigned int offset)
+{
+	struct usb_serial *serial = gpiochip_get_data(gc);
+	struct cp210x_serial_private *priv = usb_get_serial_data(serial);
+
+	switch (offset) {
+	case 0:
+		if (priv->config & CP2104_GPIO0_TXLED_MODE)
+			return -ENODEV;
+		break;
+	case 1:
+		if (priv->config & CP2104_GPIO1_RXLED_MODE)
+			return -ENODEV;
+		break;
+	case 2:
+		if (priv->config & CP2104_GPIO2_RS485_MODE)
+			return -ENODEV;
+		break;
+	}
+
+	return 0;
+}
+
 static int cp2105_gpio_request(struct gpio_chip *gc, unsigned int offset)
 {
 	struct usb_serial *serial = gpiochip_get_data(gc);
@@ -1296,20 +1369,83 @@ static int cp210x_gpio_get(struct gpio_chip *gc, unsigned int gpio)
 	return !!(buf & BIT(gpio));
 }
 
+static inline void fill_gpio_write_buf(union cp210x_gpio_write *buf,
+		unsigned int gpio, int value)
+{
+	if (value == 1)
+		buf->state = 0xFF;
+	else
+		buf->state = 0x00;
+
+	buf->mask = BIT(gpio);
+}
+
+static int cp2104_gpio_set_result(struct gpio_chip *gc, unsigned int gpio,
+		int value)
+{
+	struct usb_serial *serial = gpiochip_get_data(gc);
+	union cp210x_gpio_write buf;
+
+	fill_gpio_write_buf(&buf, gpio, value);
+	return cp210x_write_vendor_index(serial, REQTYPE_HOST_TO_INTERFACE,
+					 CP210X_WRITE_LATCH,
+					 buf.mask_and_state);
+}
+
+static void cp2104_gpio_set(struct gpio_chip *gc, unsigned int gpio, int value)
+{
+	cp2104_gpio_set_result(gc, gpio, value);
+}
+
 static void cp2105_gpio_set(struct gpio_chip *gc, unsigned int gpio, int value)
 {
 	struct usb_serial *serial = gpiochip_get_data(gc);
-	struct cp210x_gpio_write buf;
+	union cp210x_gpio_write buf;
 
-	if (value == 1)
-		buf.state = BIT(gpio);
-	else
-		buf.state = 0;
-
-	buf.mask = BIT(gpio);
-
+	fill_gpio_write_buf(&buf, gpio, value);
 	cp210x_write_vendor_block(serial, REQTYPE_HOST_TO_INTERFACE,
 				  CP210X_WRITE_LATCH, &buf, sizeof(buf));
+}
+
+static int cp2104_gpio_direction_get(struct gpio_chip *gc, unsigned int gpio)
+{
+	struct usb_serial *serial = gpiochip_get_data(gc);
+	struct cp210x_serial_private *priv = usb_get_serial_data(serial);
+
+	return !!(priv->gpio_direction & BIT(gpio));
+}
+
+static int cp2104_gpio_direction_input(struct gpio_chip *gc, unsigned int gpio)
+{
+	struct usb_serial *serial = gpiochip_get_data(gc);
+	struct cp210x_serial_private *priv = usb_get_serial_data(serial);
+	int result;
+
+	/* Input is supported only in open-drain mode. */
+	if (priv->gpio_mode & BIT(gpio))
+		return -ENOTSUPP;
+
+	/* Configure as "high-impendance input". This connects pin to the
+	 * VIO rail (usually 3.3V) through an internal pull-up resistor.
+	 */
+	result = cp2104_gpio_set_result(gc, gpio, 1);
+	if (result < 0)
+		return result;
+
+	priv->gpio_direction |= BIT(gpio);
+
+	return 0;
+}
+
+static int cp2104_gpio_direction_output(struct gpio_chip *gc, unsigned int gpio,
+					int value)
+{
+	struct usb_serial *serial = gpiochip_get_data(gc);
+	struct cp210x_serial_private *priv = usb_get_serial_data(serial);
+
+	priv->gpio_direction &= ~BIT(gpio);
+
+	return 0;
 }
 
 static int cp2105_gpio_direction_get(struct gpio_chip *gc, unsigned int gpio)
@@ -1344,6 +1480,43 @@ static int cp210x_gpio_set_single_ended(struct gpio_chip *gc, unsigned int gpio,
 		return 0;
 
 	return -ENOTSUPP;
+}
+
+static int cp2104_gpio_init(struct usb_serial *serial)
+{
+	struct cp210x_serial_private *priv = usb_get_serial_data(serial);
+	struct cp2104_config config;
+	int result;
+
+	result = cp210x_read_vendor_block(serial, REQTYPE_DEVICE_TO_HOST,
+					  CP210X_GET_PORTCONFIG, &config,
+					  sizeof(config));
+	if (result < 0)
+		return result;
+
+	priv->config = config.cfg;
+	priv->gpio_mode = (u8)(le16_to_cpu(config.gpio_mode) &
+					CP2104_GPIO_MODE_MASK);
+	priv->gc.ngpio = 4;
+
+	priv->gc.label = "cp210x";
+	priv->gc.request = cp2104_gpio_request;
+	priv->gc.get_direction = cp2104_gpio_direction_get;
+	priv->gc.direction_input = cp2104_gpio_direction_input;
+	priv->gc.direction_output = cp2104_gpio_direction_output;
+	priv->gc.get = cp210x_gpio_get;
+	priv->gc.set = cp2104_gpio_set;
+	priv->gc.set_single_ended = cp210x_gpio_set_single_ended;
+	priv->gc.owner = THIS_MODULE;
+	priv->gc.parent = &serial->interface->dev;
+	priv->gc.base = -1;
+	priv->gc.can_sleep = true;
+
+	result = gpiochip_add_data(&priv->gc, serial);
+	if (!result)
+		priv->gpio_registered = true;
+
+	return result;
 }
 
 /*
@@ -1428,6 +1601,11 @@ static void cp210x_gpio_remove(struct usb_serial *serial)
 
 #else
 
+static int cp2104_gpio_init(struct usb_serial *serial)
+{
+	return 0;
+}
+
 static int cp2105_shared_gpio_init(struct usb_serial *serial)
 {
 	return 0;
@@ -1473,6 +1651,15 @@ static int cp210x_port_remove(struct usb_serial_port *port)
 	return 0;
 }
 
+static inline void check_gpio_init_result(struct usb_serial *serial,
+		int result)
+{
+	if (result < 0) {
+		dev_err(&serial->interface->dev,
+			"GPIO initialisation failed, continuing without GPIO support\n");
+	}
+}
+
 static int cp210x_attach(struct usb_serial *serial)
 {
 	int result;
@@ -1490,12 +1677,15 @@ static int cp210x_attach(struct usb_serial *serial)
 
 	usb_set_serial_data(serial, priv);
 
-	if (priv->partnum == CP210X_PARTNUM_CP2105) {
+	switch (priv->partnum) {
+	case CP210X_PARTNUM_CP2104:
+		result = cp2104_gpio_init(serial);
+		check_gpio_init_result(serial, result);
+		break;
+	case CP210X_PARTNUM_CP2105:
 		result = cp2105_shared_gpio_init(serial);
-		if (result < 0) {
-			dev_err(&serial->interface->dev,
-				"GPIO initialisation failed, continuing without GPIO support\n");
-		}
+		check_gpio_init_result(serial, result);
+		break;
 	}
 
 	return 0;
