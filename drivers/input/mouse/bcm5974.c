@@ -731,9 +731,14 @@ static void bcm5974_irq_button(struct urb *urb)
 		goto exit;
 	}
 
-	if (report_bt_state(dev, dev->bt_urb->actual_length))
-		dprintk(1, "bcm5974: bad button package, length: %d\n",
-			dev->bt_urb->actual_length);
+	if (report_bt_state(dev, dev->bt_urb->actual_length) && (debug >= 1)) {
+		printk(KERN_DEBUG "bcm5974: bad button package, length: %d\n",
+		       dev->bt_urb->actual_length);
+		print_hex_dump_bytes("bcm5974: bad button package: ",
+				     DUMP_PREFIX_NONE,
+				     dev->tp_data,
+				     dev->tp_urb->actual_length);
+	}
 
 exit:
 	error = usb_submit_urb(dev->bt_urb, GFP_ATOMIC);
@@ -766,9 +771,14 @@ static void bcm5974_irq_trackpad(struct urb *urb)
 	if (dev->tp_urb->actual_length == 2)
 		goto exit;
 
-	if (report_tp_state(dev, dev->tp_urb->actual_length))
-		dprintk(1, "bcm5974: bad trackpad package, length: %d\n",
-			dev->tp_urb->actual_length);
+	if (report_tp_state(dev, dev->tp_urb->actual_length) && (debug >= 1)) {
+		printk(KERN_DEBUG "bcm5974: bad trackpad package, length: %d\n",
+		       dev->tp_urb->actual_length);
+		print_hex_dump_bytes("bcm5974: bad trackpad package: ",
+				     DUMP_PREFIX_NONE,
+				     dev->tp_data,
+				     dev->tp_urb->actual_length);
+	}
 
 exit:
 	error = usb_submit_urb(dev->tp_urb, GFP_ATOMIC);
