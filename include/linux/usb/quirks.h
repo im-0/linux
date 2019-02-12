@@ -69,4 +69,20 @@
 /* Hub needs extra delay after resetting its port. */
 #define USB_QUIRK_HUB_SLOW_RESET		BIT(14)
 
+/*
+ * USB 3.0 (SuperSpeed) device does not support the U3 link state.
+ *
+ * On suspend or port disable: disable link on device's port instead of
+ * changing link state to U3. On resume: enable link again, enable port/device
+ * reset.
+ *
+ * Has effect only on USB 3.0 devices connected to USB 3.0 hubs.
+ *
+ * Remote wakeup is not supported for devices with this quirk enabled.
+ *
+ * After disabling port with this quirk using hub_port_disable(), host
+ * controller will not signal the host when device is plugged or unplugged.
+ */
+#define USB_QUIRK_NO_SS_LS_U3			BIT(15)
+
 #endif /* __LINUX_USB_QUIRKS_H */

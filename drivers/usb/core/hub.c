@@ -2806,6 +2806,8 @@ static int hub_port_reset(struct usb_hub *hub, int port1,
 	struct usb_port *port_dev = hub->ports[port1 - 1];
 	int reset_recovery_time;
 
+	status = hub_port_status(hub, port1, &portstatus, &portchange);
+
 	if (!hub_is_superspeed(hub->hdev)) {
 		if (warm) {
 			dev_err(hub->intfdev, "only USB3 hub support "
@@ -2821,12 +2823,22 @@ static int hub_port_reset(struct usb_hub *hub, int port1,
 		 * If the caller hasn't explicitly requested a warm reset,
 		 * double check and see if one is needed.
 		 */
-		if (hub_port_status(hub, port1, &portstatus, &portchange) == 0)
+		if (status == 0)
 			if (hub_port_warm_reset_required(hub, port1,
 							portstatus))
 				warm = true;
 	}
 	clear_bit(port1, hub->warm_reset_bits);
+
+	if (status == 0 && hub_is_superspeed(hub->hdev) &&
+			(portstatus & USB_PORT_STAT_LINK_STATE) ==
+			USB_SS_PORT_LS_SS_DISABLED) {
+		dev_dbg(&port_dev->dev, "enabling link...\n");
+		status = hub_set_port_link_state(hub, port1,
+				USB_SS_PORT_LS_RX_DETECT);
+		if (status)
+			dev_warn(&port_dev->dev, "can't enable link\n");
+	}
 
 	/* Reset the port */
 	for (i = 0; i < PORT_RESET_TRIES; i++) {
@@ -3169,6 +3181,54 @@ static int wait_for_status(int status, struct usb_device *udev,
 	return status;
 }
 
+static bool is_port_ls_ss_disabled(u16 portchange, u16 portstatus)
+{
+	return (portchange & USB_PORT_STAT_C_CONNECTION) &&
+			((portstatus & USB_PORT_STAT_LINK_STATE) ==
+			USB_SS_PORT_LS_SS_DISABLED);
+}
+
+static int wait_for_ls_ss_disabled(int status, struct usb_device *udev,
+		struct usb_hub *hub, int port1)
+{
+	int delay_ms;
+	u16 portchange, portstatus;
+
+	if (status == 0)
+		status = hub_port_status(hub, port1, &portstatus, &portchange);
+
+	status = wait_for_status(status, udev,
+			hub, port1,
+			&portchange, &portstatus,
+			2000, 20, &delay_ms,
+			is_port_ls_ss_disabled);
+	dev_dbg(&udev->dev, "Waited %dms for LS_SS_DISABLED, status == %d\n",
+			delay_ms, status);
+	return status;
+}
+
+static int usb3_disable_link(struct usb_device *udev, struct usb_hub *hub)
+{
+	int port1 = udev->portnum;
+	struct usb_port *port_dev = hub->ports[port1 - 1];
+	int status;
+
+	dev_dbg(&port_dev->dev, "disabling link...\n");
+	status = hub_set_port_link_state(hub, port1,
+			USB_SS_PORT_LS_SS_DISABLED);
+	if (status)
+		dev_dbg(&port_dev->dev, "can't disable link\n");
+	status = wait_for_ls_ss_disabled(status, udev, hub, port1);
+
+	/* Suppress connection change event to pretend that device was not
+	 * disconnected.
+	 */
+	usb_clear_port_feature(hub->hdev, port1,
+			USB_PORT_FEAT_C_CONNECTION);
+
+	return status;
+}
+
 /*
  * usb_port_suspend - suspend a usb device's upstream port
  * @udev: device that's no longer in active use, not a root hub
@@ -3255,10 +3315,20 @@ int usb_port_suspend(struct usb_device *udev, pm_message_t msg)
 			goto err_ltm;
 	}
 
-	/* see 7.1.7.6 */
-	if (hub_is_superspeed(hub->hdev))
-		status = hub_set_port_link_state(hub, port1, USB_SS_PORT_LS_U3);
-
+	if (hub_is_superspeed(hub->hdev)) {
+		if (udev->quirks & USB_QUIRK_NO_SS_LS_U3) {
+			dev_warn_once(&port_dev->dev,
+					"suspend: disabling link instead of U3, host will not detect plug/unplug events on this port\n");
+			if (udev->do_remote_wakeup)
+				dev_warn_once(&port_dev->dev,
+						"suspend: remote wakeup will not work because of disabled link\n");
+			status = usb3_disable_link(udev, hub);
+		} else {
+			/* see 7.1.7.6 */
+			status = hub_set_port_link_state(
+					hub, port1, USB_SS_PORT_LS_U3);
+		}
+	}
 	/*
 	 * For system suspend, we do not need to enable the suspend feature
 	 * on individual USB-2 ports.  The devices will automatically go
@@ -3509,8 +3579,28 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 
 	usb_lock_port(port_dev);
 
-	/* Skip the initial Clear-Suspend step for a remote wakeup */
 	status = hub_port_status(hub, port1, &portstatus, &portchange);
+	if (status)
+		dev_dbg(&port_dev->dev,
+				"can't get initial portstatus, status %d\n",
+				status);
+
+	if (status == 0 && hub_is_superspeed(hub->hdev)) {
+		if ((portstatus & USB_PORT_STAT_LINK_STATE) ==
+				USB_SS_PORT_LS_SS_DISABLED) {
+			if (!(udev->quirks & USB_QUIRK_NO_SS_LS_U3))
+				dev_warn(&port_dev->dev,
+						"unexpected: link was disabled\n");
+			udev->reset_resume = 1;
+			goto LinkStateReady;
+		} else if (udev->quirks & USB_QUIRK_NO_SS_LS_U3) {
+			dev_warn(&port_dev->dev,
+					"unexpected: link was not disabled\n");
+			udev->reset_resume = 1;
+		}
+	}
+
+	/* Skip the initial Clear-Suspend step for a remote wakeup */
 	if (status == 0 && !port_is_suspended(hub, portstatus)) {
 		if (portchange & USB_PORT_STAT_C_SUSPEND)
 			pm_wakeup_event(&udev->dev, 0);
@@ -3523,6 +3613,8 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 	else
 		status = usb_clear_port_feature(hub->hdev,
 				port1, USB_PORT_FEAT_SUSPEND);
+
+ LinkStateReady:
 	if (status) {
 		dev_dbg(&port_dev->dev, "can't resume, status %d\n", status);
 	} else {
@@ -4234,12 +4326,12 @@ EXPORT_SYMBOL_GPL(usb_unlocked_enable_lpm);
 
 /* usb3 devices use U3 for disabled, make sure remote wakeup is disabled */
 static void hub_usb3_port_prepare_disable(struct usb_hub *hub,
-					  struct usb_port *port_dev)
+					  struct usb_port *port_dev,
+					  struct usb_device *udev)
 {
-	struct usb_device *udev = port_dev->child;
 	int ret;
 
-	if (udev && udev->port_is_suspended && udev->do_remote_wakeup) {
+	if (udev->port_is_suspended && udev->do_remote_wakeup) {
 		ret = hub_set_port_link_state(hub, port_dev->portnum,
 					      USB_SS_PORT_LS_U0);
 		if (!ret) {
@@ -4310,9 +4402,28 @@ static int hub_port_disable(struct usb_hub *hub, int port1, int set_state)
 
 	if (!hub->error) {
 		if (hub_is_superspeed(hub->hdev)) {
-			hub_usb3_port_prepare_disable(hub, port_dev);
-			ret = hub_set_port_link_state(hub, port_dev->portnum,
-						      USB_SS_PORT_LS_U3);
+			struct usb_device *udev = port_dev->child;
+			bool u3_supported = true;
+
+			if (udev) {
+				hub_usb3_port_prepare_disable(
+						hub, port_dev, udev);
+
+				if (udev->quirks & USB_QUIRK_NO_SS_LS_U3)
+					u3_supported = false;
+			}
+
+			if (u3_supported) {
+				ret = hub_set_port_link_state(
+						hub, port_dev->portnum,
+						USB_SS_PORT_LS_U3);
+			} else {
+				dev_warn_once(&port_dev->dev,
+						"port disable: disabling link instead of U3, host will not detect plug/unplug events on this port\n");
+				ret = hub_set_port_link_state(
+						hub, port_dev->portnum,
+						USB_SS_PORT_LS_SS_DISABLED);
+			}
 		} else {
 			ret = usb_clear_port_feature(hdev, port1,
 					USB_PORT_FEAT_ENABLE);

@@ -131,6 +131,9 @@ static int quirks_param_set(const char *val, const struct kernel_param *kp)
 			case 'o':
 				flags |= USB_QUIRK_HUB_SLOW_RESET;
 				break;
+			case 'p':
+				flags |= USB_QUIRK_NO_SS_LS_U3;
+				break;
 			/* Ignore unrecognized flag characters */
 			}
 		}
