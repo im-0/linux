@@ -69,4 +69,13 @@
 /* Hub needs extra delay after resetting its port. */
 #define USB_QUIRK_HUB_SLOW_RESET		BIT(14)
 
+/*
+ * Disable link on device's port before system suspend and then
+ * enable it again after resume. This also enables device reset
+ * after resume.
+ *
+ * Has effect only on USB 3.0 devices connected to USB 3.0 ports.
+ */
+#define USB_QUIRK_DISABLE_LINK_ON_SUSPEND	BIT(15)
+
 #endif /* __LINUX_USB_QUIRKS_H */

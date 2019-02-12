@@ -3230,8 +3230,22 @@ int usb_port_suspend(struct usb_device *udev, pm_message_t msg)
 			goto err_ltm;
 	}
 
+	if (udev->disable_link_on_suspend && !hub_is_superspeed(hub->hdev)) {
+		dev_dbg(&udev->dev,
+				"disabling link unsupported on <USB 3.0\n");
+		udev->disable_link_on_suspend = 0;
+	}
+
+	if (udev->disable_link_on_suspend) {
+		status = hub_set_port_link_state(hub, port1,
+				USB_SS_PORT_LS_SS_DISABLED);
+		if (status) {
+			dev_dbg(&port_dev->dev, "can't disable link\n");
+			udev->disable_link_on_suspend = 0;
+		}
+	}
 	/* see 7.1.7.6 */
-	if (hub_is_superspeed(hub->hdev))
+	else if (hub_is_superspeed(hub->hdev))
 		status = hub_set_port_link_state(hub, port1, USB_SS_PORT_LS_U3);
 
 	/*
@@ -3431,6 +3445,32 @@ static int wait_for_connected(struct usb_device *udev,
 	return status;
 }
 
+static int wait_for_link(struct usb_device *udev,
+		struct usb_hub *hub, int port1,
+		u16 *portchange, u16 *portstatus)
+{
+	int status = 0, delay_ms = 0;
+
+	while (delay_ms < 2000) {
+		status = hub_port_status(hub, port1, portstatus, portchange);
+
+		if (status || ((*portstatus & USB_PORT_STAT_LINK_STATE) ==
+					USB_SS_PORT_LS_POLLING) ||
+				(*portstatus & USB_PORT_STAT_CONNECTION))
+			break;
+
+		msleep(20);
+		delay_ms += 20;
+	}
+	dev_dbg(&udev->dev, "waited %dms for link, status %d\n", delay_ms,
+			status);
+
+	if (delay_ms >= 2000)
+		status = -ENODEV;
+
+	return status;
+}
+
 /*
  * usb_port_resume - re-activate a suspended usb device's upstream port
  * @udev: device to re-activate, not a root hub
@@ -3484,8 +3524,43 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 
 	usb_lock_port(port_dev);
 
-	/* Skip the initial Clear-Suspend step for a remote wakeup */
 	status = hub_port_status(hub, port1, &portstatus, &portchange);
+	if (status)
+		dev_dbg(&udev->dev,
+				"port status: first read failed, status %d\n",
+				status);
+
+	if (status == 0 && udev->disable_link_on_suspend) {
+		if ((portstatus & USB_PORT_STAT_LINK_STATE) ==
+				USB_SS_PORT_LS_SS_DISABLED) {
+			status = hub_set_port_link_state(hub, port1,
+					USB_SS_PORT_LS_RX_DETECT);
+			if (status) {
+				dev_dbg(&port_dev->dev, "can't enable link\n");
+				goto SuspendCleared;
+			}
+
+			status = wait_for_link(udev, hub, port1, &portchange,
+					&portstatus);
+			if (status) {
+				dev_dbg(&port_dev->dev,
+						"wait for link failed\n");
+				goto SuspendCleared;
+			}
+			if (portstatus & USB_PORT_STAT_CONNECTION) {
+				dev_dbg(&port_dev->dev,
+						"connected after enabling link\n");
+				udev->disable_link_on_suspend = 0;
+			}
+
+			set_bit(port1, hub->warm_reset_bits);
+		} else {
+			dev_dbg(&port_dev->dev, "link is not disabled\n");
+			udev->disable_link_on_suspend = 0;
+		}
+	}
+
+	/* Skip the initial Clear-Suspend step for a remote wakeup */
 	if (status == 0 && !port_is_suspended(hub, portstatus)) {
 		if (portchange & USB_PORT_STAT_C_SUSPEND)
 			pm_wakeup_event(&udev->dev, 0);
@@ -3530,7 +3605,7 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 		}
 	}
 
-	if (udev->persist_enabled)
+	if (udev->persist_enabled && !udev->disable_link_on_suspend)
 		status = wait_for_connected(udev, hub, &port1, &portchange,
 				&portstatus);
 
@@ -4069,7 +4144,8 @@ static int usb_disable_link_state(struct usb_hcd *hcd, struct usb_device *udev,
 	if (usb_set_lpm_timeout(udev, state, 0))
 		return -EBUSY;
 
-	usb_set_device_initiated_lpm(udev, state, false);
+	if (!udev->disable_link_on_suspend)
+		usb_set_device_initiated_lpm(udev, state, false);
 
 	if (hcd->driver->disable_usb3_lpm_timeout(hcd, udev, state))
 		dev_warn(&udev->dev, "Could not disable xHCI %s timeout, "

@@ -1145,6 +1145,10 @@ static int usb_suspend_device(struct usb_device *udev, pm_message_t msg)
 			udev->state == USB_STATE_SUSPENDED)
 		goto done;
 
+	if (!PMSG_IS_AUTO(msg) &&
+			(udev->quirks & USB_QUIRK_DISABLE_LINK_ON_SUSPEND))
+		udev->disable_link_on_suspend = 1;
+
 	/* For devices that don't have a driver, we do a generic suspend. */
 	if (udev->dev.driver)
 		udriver = to_usb_device_driver(udev->dev.driver);
@@ -1188,6 +1192,8 @@ static int usb_resume_device(struct usb_device *udev, pm_message_t msg)
 
  done:
 	dev_vdbg(&udev->dev, "%s: status %d\n", __func__, status);
+	if (!status)
+		udev->disable_link_on_suspend = 0;
 	return status;
 }
 
