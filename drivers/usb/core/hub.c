@@ -3004,7 +3004,8 @@ static int check_port_resume_type(struct usb_device *udev,
 			!port_is_power_on(hub, portstatus)) {
 		if (status >= 0)
 			status = -ENODEV;
-	} else if (!(portstatus & USB_PORT_STAT_CONNECTION)) {
+	} else if (!(portstatus & USB_PORT_STAT_CONNECTION)
+			&& !udev->reset_resume) {
 		if (retries--) {
 			usleep_range(200, 300);
 			status = hub_port_status(hub, port1, &portstatus,
@@ -3554,7 +3555,7 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 		}
 	}
 
-	if (udev->persist_enabled)
+	if (udev->persist_enabled && !udev->reset_resume)
 		status = wait_for_connected(status, udev, hub, port1,
 				&portchange, &portstatus);
 
