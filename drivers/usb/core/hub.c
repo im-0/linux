@@ -3555,7 +3555,7 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 	}
 
 	if (udev->persist_enabled)
-		status = wait_for_connected(0, udev, hub, port1,
+		status = wait_for_connected(status, udev, hub, port1,
 				&portchange, &portstatus);
 
 	status = check_port_resume_type(udev,
