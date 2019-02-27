@@ -2797,6 +2797,8 @@ static int hub_port_wait_reset(struct usb_hub *hub, int port1,
 	return 0;
 }
 
+static int port_is_power_on(struct usb_hub *hub, unsigned portstatus);
+
 /* Handle port reset and port warm(BH) reset (for USB3 protocol ports) */
 static int hub_port_reset(struct usb_hub *hub, int port1,
 			struct usb_device *udev, unsigned int delay, bool warm)
@@ -2829,6 +2831,12 @@ static int hub_port_reset(struct usb_hub *hub, int port1,
 				warm = true;
 	}
 	clear_bit(port1, hub->warm_reset_bits);
+
+	if (status == 0 && !port_is_power_on(hub, portstatus)) {
+		status = set_port_feature(hub->hdev, port1,
+				USB_PORT_FEAT_POWER);
+		msleep(hub_power_on_good_delay(hub));
+	}
 
 	if (status == 0 && hub_is_superspeed(hub->hdev) &&
 			(portstatus & USB_PORT_STAT_LINK_STATE) ==
@@ -3013,7 +3021,8 @@ static int check_port_resume_type(struct usb_device *udev,
 	}
 	/* Is the device still present? */
 	else if (status || port_is_suspended(hub, portstatus) ||
-			!port_is_power_on(hub, portstatus)) {
+			(!port_is_power_on(hub, portstatus) &&
+			!(udev->quirks & USB_QUIRK_NO_SS_LS_U3))) {
 		if (status >= 0)
 			status = -ENODEV;
 	} else if (!(portstatus & USB_PORT_STAT_CONNECTION)
@@ -3225,6 +3234,12 @@ static int usb3_disable_link(struct usb_device *udev, struct usb_hub *hub)
 	 */
 	usb_clear_port_feature(hub->hdev, port1,
 			USB_PORT_FEAT_C_CONNECTION);
+
+	if (status == 0) {
+		status = usb_clear_port_feature(hub->hdev, port1,
+				USB_PORT_FEAT_POWER);
+		msleep(2 * hub_power_on_good_delay(hub));
+	}
 
 	return status;
 }
@@ -3584,6 +3599,15 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 		dev_dbg(&port_dev->dev,
 				"can't get initial portstatus, status %d\n",
 				status);
+
+	if (status == 0 && !port_is_power_on(hub, portstatus) &&
+			!(udev->quirks & USB_QUIRK_NO_SS_LS_U3))
+		dev_warn(&port_dev->dev,
+				"unexpected: port not powered\n");
+	if (status == 0 && port_is_power_on(hub, portstatus) &&
+			(udev->quirks & USB_QUIRK_NO_SS_LS_U3))
+		dev_warn(&port_dev->dev,
+				"unexpected: port is powered\n");
 
 	if (status == 0 && hub_is_superspeed(hub->hdev)) {
 		if ((portstatus & USB_PORT_STAT_LINK_STATE) ==
