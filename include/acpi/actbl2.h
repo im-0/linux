@@ -43,6 +43,7 @@
 #define ACPI_SIG_SBST           "SBST"	/* Smart Battery Specification Table */
 #define ACPI_SIG_SDEI           "SDEI"	/* Software Delegated Exception Interface Table */
 #define ACPI_SIG_SDEV           "SDEV"	/* Secure Devices table */
+#define ACPI_SIG_VFCT           "VFCT"	/* AMD Video BIOS images */
 #define ACPI_SIG_NHLT           "NHLT"	/* Non-HDAudio Link Table */
 
 /*
@@ -1735,6 +1736,34 @@ struct acpi_sdev_pcie {
 struct acpi_sdev_pcie_path {
 	u8 device;
 	u8 function;
+};
+
+
+/*******************************************************************************
+ *
+ * VFCT - AMD Video BIOS images
+ *
+ ******************************************************************************/
+
+struct acpi_vfct_header {
+	u8 table_uuid[16];
+	u32 vbios_image_offset;	/* Offset to the first GOP_VBIOS_CONTENT block from the beginning of the structure */
+	u32 lib1_image_offset;	/* Offset to the first GOP_LIB1_CONTENT block from the beginning of the structure */
+	u8 reserved[16];
+};
+
+/* Image header */
+
+struct acpi_vfct_image_header {
+	u32 pci_bus;
+	u32 pci_device;
+	u32 pci_function;
+	u32 vendor_id;
+	u32 device_id;
+	u32 ssvid;
+	u32 ssid;
+	u32 revision;
+	u32 image_length;
 };
 
 /* Reset to default packing */
